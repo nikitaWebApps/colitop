@@ -1,16 +1,19 @@
 # colitop
 
-A minimal htop-style terminal monitor for [Colima](https://github.com/abiosoft/colima).
+A minimal TUI (terminal user interface) monitor for [Colima](https://github.com/abiosoft/colima), inspired by [htop](https://github.com/htop-dev/htop).
 
 It shows, refreshed live:
 
 - **VM meters**: CPU, memory and the Docker data disk inside the Colima VM
-- **Running containers**: CPU %, memory, memory %, PIDs and network I/O
-- **Volumes**: size, whether a container uses it, and its Compose / Supabase project
+- **Overview tab**
+  - **Running containers**: CPU %, memory, memory %, PIDs and network I/O
+  - **Volumes**: size, whether a container uses it, and its Compose / Supabase project
+- **Images tab**: size, unique size, number of containers using it, and age of every image in the profile
 - **Totals**: image size, reclaimable space, volumes and build cache
 
 ```
  colitop  profile: personal  context: colima-personal                  23:21:19
+  1 Overview   2 Images
 
  CPU  [||                                      ]   6.1%  2 cpus
  MEM  [||||||||||||                            ]  30.5%  1.2G / 3.8G
@@ -28,7 +31,7 @@ It shows, refreshed live:
  supabase_storage_flashcards                      0B     yes  flashcards
 
  Images 8: 6.481GB, 0B reclaimable   Volumes: 79.11MB   Build cache: 0B
- q quit   s sort (cpu / mem / name)
+ q quit   tab / 1-2 switch tab   s sort (cpu / mem / name)
 ```
 
 ## Requirements
@@ -56,12 +59,18 @@ colitop -c my-context   # a specific Docker context
 
 | Key | Action |
 | --- | --- |
-| `s` | Cycle container sort: CPU, memory, name |
+| `Tab` | Switch to the next tab |
+| `1` / `2` | Open the Overview / Images tab |
+| `s` | Cycle container sort: CPU, memory, name (Overview tab) |
 | `q` / `Esc` | Quit |
 
 The Docker context defaults to `colima` for the default profile and `colima-<profile>` for named profiles, so colitop always watches Colima, whatever `DOCKER_CONTEXT` your shell has set.
 
-Meters turn yellow above 60% and red above 85%. Container stats and VM meters refresh about every 2 seconds, volume sizes every 10 seconds. If the VM is stopped, the error is shown in place of the data and colitop recovers once the VM is back.
+Meters turn yellow above 60% and red above 85%. Container stats and VM meters refresh about every 2 seconds, volume and image sizes every 10 seconds. Images are sorted by size, largest first. If the VM is stopped, the error is shown in place of the data and colitop recovers once the VM is back.
+
+## Built with Claude
+
+colitop was created with Anthropic's Claude models, using [Claude Code](https://claude.com/claude-code).
 
 ## License
 

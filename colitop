@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""colitop: live terminal view of a Colima VM, its running containers and Docker volumes."""
+"""colitop: live terminal view of a Colima VM, its running containers, Docker volumes and images."""
 
 import argparse
 import curses
@@ -16,6 +16,7 @@ UNITS = {
     "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4,
 }
 SORTS = ("cpu", "mem", "name")
+TABS = ("overview", "images")
 VM_SCRIPT = "head -1 /proc/stat; free -b | sed -n 2p; df -B1 /var/lib/docker | tail -1; nproc"
 
 GREEN, YELLOW, RED, CYAN = 1, 2, 3, 4
@@ -58,7 +59,7 @@ def json_lines(text):
 class State:
     def __init__(self):
         self._lock = threading.Lock()
-        self._data = {"containers": [], "vm": None, "volumes": [], "summary": {}}
+        self._data = {"containers": [], "vm": None, "volumes": [], "images": [], "summary": {}}
         self._errors = {}
 
     def update(self, source, **values):
@@ -119,7 +120,7 @@ def poll_disk(state, context, stop):
         try:
             detail = json.loads(run(["docker", "--context", context, "system", "df", "-v", "--format", "{{json .}}"], timeout=60))
             summary = json_lines(run(["docker", "--context", context, "system", "df", "--format", "{{json .}}"]))
-            state.update("disk", volumes=detail.get("Volumes") or [], summary={row["Type"]: row for row in summary})
+            state.update("disk", volumes=detail.get("Volumes") or [], images=detail.get("Images") or [], summary={row["Type"]: row for row in summary})
         except Exception as error:
             state.fail("disk", error)
         stop.wait(10)
@@ -163,6 +164,20 @@ def draw_vm(scr, y, vm, error):
     return y + 4
 
 
+def draw_section(scr, y, title, header):
+    width = scr.getmaxyx()[1]
+    put(scr, y, 0, f" {title}", curses.A_BOLD | curses.color_pair(CYAN))
+    put(scr, y + 1, 0, " " + header.ljust(width - 1), curses.A_REVERSE)
+    return y + 2
+
+
+def draw_more(scr, y, total, shown):
+    if total <= shown:
+        return y
+    put(scr, y, 1, f"+{total - shown} more", curses.A_DIM)
+    return y + 1
+
+
 def fit_rows(total, available):
     """Rows to show when one line must be kept free for the "+N more" note."""
     return total if total <= available else max(1, available - 1)
@@ -183,9 +198,7 @@ def draw_containers(scr, y, rows, error, sort_key, max_rows):
     header = f"{'NAME':<{name_width}} {'CPU%':>7} {'MEM':>10} {'MEM%':>7} {'PIDS':>5}"
     if show_net:
         header += f"  {'NET I/O':<20}"
-    put(scr, y, 0, f" CONTAINERS ({len(rows)})  sorted by {sort_key}", curses.A_BOLD | curses.color_pair(CYAN))
-    put(scr, y + 1, 0, " " + header.ljust(width - 1), curses.A_REVERSE)
-    y += 2
+    y = draw_section(scr, y, f"CONTAINERS ({len(rows)})  sorted by {sort_key}", header)
     if error:
         put(scr, y, 1, error, curses.color_pair(RED))
         return y + 2
@@ -210,10 +223,7 @@ def draw_containers(scr, y, rows, error, sort_key, max_rows):
         if show_net:
             put(scr, y, x_net, row.get("NetIO", ""))
         y += 1
-    if len(rows) > len(visible):
-        put(scr, y, 1, f"+{len(rows) - len(visible)} more", curses.A_DIM)
-        y += 1
-    return y + 1
+    return draw_more(scr, y, len(rows), len(visible)) + 1
 
 
 def volume_project(volume):
@@ -228,9 +238,7 @@ def draw_volumes(scr, y, volumes, error, max_rows):
     width = scr.getmaxyx()[1]
     name_width = max(16, width - 40)
     header = f"{'VOLUME':<{name_width}} {'SIZE':>10} {'IN USE':>7}  PROJECT"
-    put(scr, y, 0, f" VOLUMES ({len(volumes)})", curses.A_BOLD | curses.color_pair(CYAN))
-    put(scr, y + 1, 0, " " + header.ljust(width - 1), curses.A_REVERSE)
-    y += 2
+    y = draw_section(scr, y, f"VOLUMES ({len(volumes)})", header)
     if error and not volumes:
         put(scr, y, 1, error, curses.color_pair(RED))
         return y + 2
@@ -249,10 +257,48 @@ def draw_volumes(scr, y, volumes, error, max_rows):
         put(scr, y, x_in_use, f"{'yes' if in_use else 'no':>7}", curses.color_pair(GREEN if in_use else YELLOW))
         put(scr, y, x_project, volume_project(volume))
         y += 1
-    if len(volumes) > len(visible):
-        put(scr, y, 1, f"+{len(volumes) - len(visible)} more", curses.A_DIM)
+    return draw_more(scr, y, len(volumes), len(visible)) + 1
+
+
+def image_name(image):
+    repo, tag = image.get("Repository", ""), image.get("Tag", "")
+    if repo in ("", "<none>"):
+        return f"<none> {image.get('ID', '').split(':')[-1][:12]}"
+    return f"{repo}:{tag}" if tag not in ("", "<none>") else repo
+
+
+def clip_start(text, width):
+    """Fit text into width by dropping its start, so the tag stays visible."""
+    return text if len(text) <= width else ".." + text[len(text) - width + 2:]
+
+
+def draw_images(scr, y, images, error, max_rows):
+    width = scr.getmaxyx()[1]
+    name_width = max(16, width - 50)
+    header = f"{'IMAGE':<{name_width}} {'SIZE':>10} {'UNIQUE':>10} {'CONTAINERS':>10}  CREATED"
+    y = draw_section(scr, y, f"IMAGES ({len(images)})  sorted by size", header)
+    if error and not images:
+        put(scr, y, 1, error, curses.color_pair(RED))
+        return y + 2
+    if not images:
+        put(scr, y, 1, "No images", curses.A_DIM)
+        return y + 2
+    x_size = 2 + name_width
+    x_unique = x_size + 11
+    x_containers = x_unique + 11
+    x_created = x_containers + 12
+    ordered = sorted(images, key=lambda image: parse_bytes(image.get("Size")), reverse=True)
+    visible = ordered[:fit_rows(len(images), max_rows)]
+    for image in visible:
+        containers = image.get("Containers", "0")
+        in_use = containers not in ("0", "")
+        put(scr, y, 1, clip_start(image_name(image), name_width))
+        put(scr, y, x_size, f"{image.get('Size', ''):>10}")
+        put(scr, y, x_unique, f"{image.get('UniqueSize', ''):>10}")
+        put(scr, y, x_containers, f"{containers:>10}", curses.color_pair(GREEN if in_use else YELLOW))
+        put(scr, y, x_created, image.get("CreatedSince", ""))
         y += 1
-    return y + 1
+    return draw_more(scr, y, len(images), len(visible)) + 1
 
 
 def draw_summary(scr, y, summary):
@@ -268,7 +314,15 @@ def draw_summary(scr, y, summary):
         put(scr, y, 1, "   ".join(parts), curses.A_DIM)
 
 
-def draw(scr, state, args, sort_key):
+def draw_tabs(scr, y, active):
+    x = 1
+    for index, name in enumerate(TABS):
+        label = f" {index + 1} {name.capitalize()} "
+        put(scr, y, x, label, (curses.A_REVERSE | curses.A_BOLD) if name == active else curses.A_DIM)
+        x += len(label) + 1
+
+
+def draw(scr, state, args, tab, sort_key):
     data, errors = state.snapshot()
     height, width = scr.getmaxyx()
     scr.erase()
@@ -278,14 +332,20 @@ def draw(scr, state, args, sort_key):
     if width >= len(title) + len(clock) + 1:
         put(scr, 0, width - len(clock), clock, curses.A_REVERSE | curses.A_BOLD)
 
-    y = draw_vm(scr, 2, data["vm"], errors.get("vm"))
-    volume_rows = min(len(data["volumes"]) or 1, 6)
-    container_rows = max(1, height - y - volume_rows - 8)
-    y = draw_containers(scr, y, data["containers"], errors.get("containers"), sort_key, container_rows)
-    y = draw_volumes(scr, y, data["volumes"], errors.get("disk"), max(1, height - y - 5))
+    draw_tabs(scr, 1, tab)
+    y = draw_vm(scr, 3, data["vm"], errors.get("vm"))
+    footer = " q quit   tab / 1-2 switch tab"
+    if tab == "overview":
+        volume_rows = min(len(data["volumes"]) or 1, 6)
+        container_rows = max(1, height - y - volume_rows - 8)
+        y = draw_containers(scr, y, data["containers"], errors.get("containers"), sort_key, container_rows)
+        y = draw_volumes(scr, y, data["volumes"], errors.get("disk"), max(1, height - y - 5))
+        footer += "   s sort (cpu / mem / name)"
+    else:
+        y = draw_images(scr, y, data["images"], errors.get("disk"), max(1, height - y - 5))
     draw_summary(scr, y, data["summary"])
 
-    put(scr, height - 1, 0, " q quit   s sort (cpu / mem / name)".ljust(width), curses.A_REVERSE)
+    put(scr, height - 1, 0, footer.ljust(width), curses.A_REVERSE)
 
 
 def app(scr, args):
@@ -302,21 +362,25 @@ def app(scr, args):
     for target, target_arg in pollers:
         threading.Thread(target=target, args=(state, target_arg, stop), daemon=True).start()
 
-    sort_index = 0
+    tab_index = sort_index = 0
     try:
         while True:
-            draw(scr, state, args, SORTS[sort_index])
+            draw(scr, state, args, TABS[tab_index], SORTS[sort_index])
             key = scr.getch()
             if key in (ord("q"), ord("Q"), 27):
                 break
-            if key in (ord("s"), ord("S")):
+            if key == ord("\t"):
+                tab_index = (tab_index + 1) % len(TABS)
+            elif ord("1") <= key < ord("1") + len(TABS):
+                tab_index = key - ord("1")
+            elif key in (ord("s"), ord("S")) and TABS[tab_index] == "overview":
                 sort_index = (sort_index + 1) % len(SORTS)
     finally:
         stop.set()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Live view of a Colima VM, its running containers and volumes.")
+    parser = argparse.ArgumentParser(description="Live view of a Colima VM, its running containers, volumes and images.")
     parser.add_argument("-p", "--profile", default=os.environ.get("COLIMA_PROFILE") or "default", help="Colima profile (default: $COLIMA_PROFILE)")
     parser.add_argument("-c", "--context", help="Docker context (default: colima-<profile>, or colima for the default profile)")
     args = parser.parse_args()
