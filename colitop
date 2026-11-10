@@ -1,0 +1,332 @@
+#!/usr/bin/env python3
+"""colitop: live terminal view of a Colima VM, its running containers and Docker volumes."""
+
+import argparse
+import curses
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+
+UNITS = {
+    "": 1, "b": 1,
+    "kb": 1e3, "mb": 1e6, "gb": 1e9, "tb": 1e12,
+    "kib": 1024, "mib": 1024**2, "gib": 1024**3, "tib": 1024**4,
+}
+SORTS = ("cpu", "mem", "name")
+VM_SCRIPT = "head -1 /proc/stat; free -b | sed -n 2p; df -B1 /var/lib/docker | tail -1; nproc"
+
+GREEN, YELLOW, RED, CYAN = 1, 2, 3, 4
+
+
+def parse_bytes(text):
+    match = re.match(r"\s*([\d.]+)\s*([a-zA-Z]*)", text or "")
+    if not match:
+        return 0.0
+    return float(match.group(1)) * UNITS.get(match.group(2).lower(), 1)
+
+
+def parse_percent(text):
+    try:
+        return float((text or "").rstrip("%"))
+    except ValueError:
+        return 0.0
+
+
+def human(size):
+    for unit in ("B", "K", "M", "G"):
+        if size < 1024:
+            return f"{size:.0f}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{size:.1f}T"
+
+
+def run(cmd, timeout=20):
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        message = (result.stderr or result.stdout).strip()
+        raise RuntimeError(message.splitlines()[-1] if message else f"{cmd[0]} exited with {result.returncode}")
+    return result.stdout
+
+
+def json_lines(text):
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+class State:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._data = {"containers": [], "vm": None, "volumes": [], "summary": {}}
+        self._errors = {}
+
+    def update(self, source, **values):
+        with self._lock:
+            self._data.update(values)
+            self._errors.pop(source, None)
+
+    def fail(self, source, error, **reset):
+        with self._lock:
+            self._data.update(reset)
+            self._errors[source] = str(error)
+
+    def snapshot(self):
+        with self._lock:
+            return dict(self._data), dict(self._errors)
+
+
+def poll_containers(state, context, stop):
+    while not stop.is_set():
+        try:
+            out = run(["docker", "--context", context, "stats", "--no-stream", "--format", "{{json .}}"])
+            state.update("containers", containers=json_lines(out))
+            stop.wait(1)
+        except Exception as error:
+            state.fail("containers", error, containers=[])
+            stop.wait(3)
+
+
+def poll_vm(state, profile, stop):
+    previous = None
+    while not stop.is_set():
+        try:
+            lines = run(["colima", "ssh", "-p", profile, "--", "sh", "-c", VM_SCRIPT]).splitlines()
+            ticks = [int(value) for value in lines[0].split()[1:9]]
+            idle, total = ticks[3] + ticks[4], sum(ticks)
+            cpu = None
+            if previous and total > previous[1]:
+                cpu = 100 * (1 - (idle - previous[0]) / (total - previous[1]))
+            previous = (idle, total)
+            mem, disk = lines[1].split(), lines[2].split()
+            state.update("vm", vm={
+                "cpu": cpu,
+                "cpus": int(lines[3]),
+                "mem_used": int(mem[1]) - int(mem[6]),
+                "mem_total": int(mem[1]),
+                "disk_used": int(disk[2]),
+                "disk_total": int(disk[1]),
+            })
+            stop.wait(2)
+        except Exception as error:
+            previous = None
+            state.fail("vm", error, vm=None)
+            stop.wait(5)
+
+
+def poll_disk(state, context, stop):
+    while not stop.is_set():
+        try:
+            detail = json.loads(run(["docker", "--context", context, "system", "df", "-v", "--format", "{{json .}}"], timeout=60))
+            summary = json_lines(run(["docker", "--context", context, "system", "df", "--format", "{{json .}}"]))
+            state.update("disk", volumes=detail.get("Volumes") or [], summary={row["Type"]: row for row in summary})
+        except Exception as error:
+            state.fail("disk", error)
+        stop.wait(10)
+
+
+def level_color(pct):
+    if pct >= 85:
+        return curses.color_pair(RED)
+    if pct >= 60:
+        return curses.color_pair(YELLOW)
+    return curses.color_pair(GREEN)
+
+
+def put(scr, y, x, text, attr=0):
+    height, width = scr.getmaxyx()
+    if 0 <= y < height and x < width:
+        try:
+            scr.addnstr(y, x, text, width - x, attr)
+        except curses.error:
+            pass
+
+
+def meter(scr, y, label, pct, detail):
+    width = scr.getmaxyx()[1]
+    size = max(10, min(50, width - 40))
+    filled = round(size * min(max(pct, 0), 100) / 100)
+    put(scr, y, 1, f"{label:<5}", curses.A_BOLD)
+    put(scr, y, 6, "[")
+    put(scr, y, 7, "|" * filled, level_color(pct))
+    put(scr, y, 7 + size, f"] {pct:5.1f}%  {detail}")
+
+
+def draw_vm(scr, y, vm, error):
+    if vm is None:
+        put(scr, y, 1, error or "Waiting for VM data...", curses.color_pair(RED) if error else curses.A_DIM)
+        return y + 2
+    cpu = vm["cpu"] or 0.0
+    meter(scr, y, "CPU", cpu, f"{vm['cpus']} cpus")
+    meter(scr, y + 1, "MEM", 100 * vm["mem_used"] / vm["mem_total"], f"{human(vm['mem_used'])} / {human(vm['mem_total'])}")
+    meter(scr, y + 2, "DISK", 100 * vm["disk_used"] / vm["disk_total"], f"{human(vm['disk_used'])} / {human(vm['disk_total'])}")
+    return y + 4
+
+
+def fit_rows(total, available):
+    """Rows to show when one line must be kept free for the "+N more" note."""
+    return total if total <= available else max(1, available - 1)
+
+
+def sort_containers(rows, key):
+    if key == "cpu":
+        return sorted(rows, key=lambda row: parse_percent(row.get("CPUPerc")), reverse=True)
+    if key == "mem":
+        return sorted(rows, key=lambda row: parse_bytes(row.get("MemUsage", "").split("/")[0]), reverse=True)
+    return sorted(rows, key=lambda row: row.get("Name", ""))
+
+
+def draw_containers(scr, y, rows, error, sort_key, max_rows):
+    width = scr.getmaxyx()[1]
+    show_net = width >= 90
+    name_width = max(16, width - (62 if show_net else 40))
+    header = f"{'NAME':<{name_width}} {'CPU%':>7} {'MEM':>10} {'MEM%':>7} {'PIDS':>5}"
+    if show_net:
+        header += f"  {'NET I/O':<20}"
+    put(scr, y, 0, f" CONTAINERS ({len(rows)})  sorted by {sort_key}", curses.A_BOLD | curses.color_pair(CYAN))
+    put(scr, y + 1, 0, " " + header.ljust(width - 1), curses.A_REVERSE)
+    y += 2
+    if error:
+        put(scr, y, 1, error, curses.color_pair(RED))
+        return y + 2
+    if not rows:
+        put(scr, y, 1, "No running containers", curses.A_DIM)
+        return y + 2
+    x_cpu = 2 + name_width
+    x_mem = x_cpu + 8
+    x_mem_pct = x_mem + 11
+    x_pids = x_mem_pct + 8
+    x_net = x_pids + 7
+    visible = sort_containers(rows, sort_key)[:fit_rows(len(rows), max_rows)]
+    for row in visible:
+        cpu = parse_percent(row.get("CPUPerc"))
+        mem_pct = parse_percent(row.get("MemPerc"))
+        mem = row.get("MemUsage", "").split("/")[0].strip()
+        put(scr, y, 1, row.get("Name", "")[:name_width])
+        put(scr, y, x_cpu, f"{cpu:>6.1f}%", level_color(cpu))
+        put(scr, y, x_mem, f"{mem:>10}")
+        put(scr, y, x_mem_pct, f"{mem_pct:>6.1f}%", level_color(mem_pct))
+        put(scr, y, x_pids, f"{row.get('PIDs', ''):>5}")
+        if show_net:
+            put(scr, y, x_net, row.get("NetIO", ""))
+        y += 1
+    if len(rows) > len(visible):
+        put(scr, y, 1, f"+{len(rows) - len(visible)} more", curses.A_DIM)
+        y += 1
+    return y + 1
+
+
+def volume_project(volume):
+    for label in (volume.get("Labels") or "").split(","):
+        key, _, value = label.partition("=")
+        if key in ("com.docker.compose.project", "com.supabase.cli.project"):
+            return value
+    return ""
+
+
+def draw_volumes(scr, y, volumes, error, max_rows):
+    width = scr.getmaxyx()[1]
+    name_width = max(16, width - 40)
+    header = f"{'VOLUME':<{name_width}} {'SIZE':>10} {'IN USE':>7}  PROJECT"
+    put(scr, y, 0, f" VOLUMES ({len(volumes)})", curses.A_BOLD | curses.color_pair(CYAN))
+    put(scr, y + 1, 0, " " + header.ljust(width - 1), curses.A_REVERSE)
+    y += 2
+    if error and not volumes:
+        put(scr, y, 1, error, curses.color_pair(RED))
+        return y + 2
+    if not volumes:
+        put(scr, y, 1, "No volumes", curses.A_DIM)
+        return y + 2
+    x_size = 2 + name_width
+    x_in_use = x_size + 11
+    x_project = x_in_use + 9
+    ordered = sorted(volumes, key=lambda volume: parse_bytes(volume.get("Size")), reverse=True)
+    visible = ordered[:fit_rows(len(volumes), max_rows)]
+    for volume in visible:
+        in_use = volume.get("Links", "0") not in ("0", "")
+        put(scr, y, 1, volume.get("Name", "")[:name_width])
+        put(scr, y, x_size, f"{volume.get('Size', ''):>10}")
+        put(scr, y, x_in_use, f"{'yes' if in_use else 'no':>7}", curses.color_pair(GREEN if in_use else YELLOW))
+        put(scr, y, x_project, volume_project(volume))
+        y += 1
+    if len(volumes) > len(visible):
+        put(scr, y, 1, f"+{len(volumes) - len(visible)} more", curses.A_DIM)
+        y += 1
+    return y + 1
+
+
+def draw_summary(scr, y, summary):
+    parts = []
+    images = summary.get("Images")
+    if images:
+        reclaimable = images["Reclaimable"].split(" (")[0]
+        parts.append(f"Images {images['TotalCount']}: {images['Size']}, {reclaimable} reclaimable")
+    for kind, label in (("Local Volumes", "Volumes"), ("Build Cache", "Build cache")):
+        if summary.get(kind):
+            parts.append(f"{label}: {summary[kind]['Size']}")
+    if parts:
+        put(scr, y, 1, "   ".join(parts), curses.A_DIM)
+
+
+def draw(scr, state, args, sort_key):
+    data, errors = state.snapshot()
+    height, width = scr.getmaxyx()
+    scr.erase()
+    title = f" colitop  profile: {args.profile}  context: {args.context}"
+    put(scr, 0, 0, title.ljust(width), curses.A_REVERSE | curses.A_BOLD)
+    clock = time.strftime("%H:%M:%S ")
+    if width >= len(title) + len(clock) + 1:
+        put(scr, 0, width - len(clock), clock, curses.A_REVERSE | curses.A_BOLD)
+
+    y = draw_vm(scr, 2, data["vm"], errors.get("vm"))
+    volume_rows = min(len(data["volumes"]) or 1, 6)
+    container_rows = max(1, height - y - volume_rows - 8)
+    y = draw_containers(scr, y, data["containers"], errors.get("containers"), sort_key, container_rows)
+    y = draw_volumes(scr, y, data["volumes"], errors.get("disk"), max(1, height - y - 5))
+    draw_summary(scr, y, data["summary"])
+
+    put(scr, height - 1, 0, " q quit   s sort (cpu / mem / name)".ljust(width), curses.A_REVERSE)
+
+
+def app(scr, args):
+    curses.curs_set(0)
+    if curses.has_colors():
+        curses.use_default_colors()
+        for pair, color in ((GREEN, curses.COLOR_GREEN), (YELLOW, curses.COLOR_YELLOW), (RED, curses.COLOR_RED), (CYAN, curses.COLOR_CYAN)):
+            curses.init_pair(pair, color, -1)
+    scr.timeout(500)
+
+    state = State()
+    stop = threading.Event()
+    pollers = ((poll_containers, args.context), (poll_vm, args.profile), (poll_disk, args.context))
+    for target, target_arg in pollers:
+        threading.Thread(target=target, args=(state, target_arg, stop), daemon=True).start()
+
+    sort_index = 0
+    try:
+        while True:
+            draw(scr, state, args, SORTS[sort_index])
+            key = scr.getch()
+            if key in (ord("q"), ord("Q"), 27):
+                break
+            if key in (ord("s"), ord("S")):
+                sort_index = (sort_index + 1) % len(SORTS)
+    finally:
+        stop.set()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Live view of a Colima VM, its running containers and volumes.")
+    parser.add_argument("-p", "--profile", default=os.environ.get("COLIMA_PROFILE") or "default", help="Colima profile (default: $COLIMA_PROFILE)")
+    parser.add_argument("-c", "--context", help="Docker context (default: colima-<profile>, or colima for the default profile)")
+    args = parser.parse_args()
+    if not args.context:
+        args.context = "colima" if args.profile == "default" else f"colima-{args.profile}"
+    try:
+        curses.wrapper(app, args)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
